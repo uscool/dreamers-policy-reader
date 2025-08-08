@@ -4,6 +4,7 @@ import requests
 from dotenv import load_dotenv
 from user_auth import UserAuth
 from vector_db import PolicyVectorDB
+from llm_processor import LLMProcessor
 import getpass
 
 load_dotenv()
@@ -12,6 +13,7 @@ class PolicyParseApp:
     def __init__(self):
         self.user_auth = UserAuth()
         self.vector_db = PolicyVectorDB()
+        self.llm_processor = LLMProcessor()
         self.current_user = None
     
     def login_or_register(self):
@@ -215,6 +217,16 @@ class PolicyParseApp:
                 print(f"Result {i} (Score: {score:.4f}, Type: {doc_type_result}):")
                 print(f"Content: {content}...")
                 print("-" * 80)
+            
+            # Generate LLM response if available
+            if self.llm_processor.is_available():
+                print("\n" + "=" * 80)
+                print("AI Response:")
+                llm_response = self.llm_processor.process_query(query, results)
+                print(llm_response)
+                print("=" * 80)
+            else:
+                print("\nNote: Set GOOGLE_API_KEY environment variable for AI-powered responses.")
         else:
             print("No relevant results found.")
     

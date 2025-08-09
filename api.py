@@ -1,7 +1,8 @@
+
+
 import os
 import tempfile
 from typing import List
-
 import numpy as np
 import requests
 import time
@@ -13,35 +14,36 @@ from vector_db import PolicyVectorDB
 
 
 def compute_cosine_similarity(vector_a: List[float], vector_b: List[float]) -> float:
-    """Compute cosine similarity between two equal-length vectors."""
     a = np.asarray(vector_a, dtype=np.float32)
     b = np.asarray(vector_b, dtype=np.float32)
-    denom = (np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0.0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
+    # Since embeddings are already normalized, cosine similarity = dot product
+    return float(np.dot(a, b))
 
 
 def rank_top_k_indices(embeddings: List[List[float]], query_embedding: List[float], top_k: int = 6) -> List[int]:
-    """Return indices of the top_k most similar embeddings to the query embedding."""
-    scored_indices = []
-    for index, emb in enumerate(embeddings):
-        similarity = compute_cosine_similarity(emb, query_embedding)
-        scored_indices.append((index, similarity))
-    scored_indices.sort(key=lambda x: x[1], reverse=True)
-    return [idx for idx, _ in scored_indices[:top_k]]
+    if not embeddings:
+        return []
+    
+    # Convert to numpy arrays for vectorized operations
+    embeddings_array = np.asarray(embeddings, dtype=np.float32)
+    query_array = np.asarray(query_embedding, dtype=np.float32)
+    
+    # Compute dot products (cosine similarity since vectors are normalized)
+    similarities = np.dot(embeddings_array, query_array)
+    
+    # Get top-k indices
+    top_indices = np.argsort(similarities)[::-1][:top_k]
+    return top_indices.tolist()
 
 
 load_dotenv()
 app = Flask(__name__)
 
-# Token can be provided via env; defaulting to the provided sample for convenience
 EXPECTED_TOKEN = os.getenv(
     "HACKRX_TOKEN",
     "fbc6d34d08858901d26a10f1b8796c2e77577b24bf91053390f858a35af05df7",
 )
 
-# Global singletons to avoid per-request model initialization
 VECTOR_DB_SINGLETON: PolicyVectorDB | None = None
 LLM_SINGLETON: LLMProcessor | None = None
 
@@ -59,7 +61,6 @@ def get_llm() -> LLMProcessor:
         LLM_SINGLETON = LLMProcessor()
     return LLM_SINGLETON
 
-# Eagerly warm up models on import (reduces first-request latency)
 try:
     _ = get_vector_db()
     _ = get_llm()
@@ -67,33 +68,40 @@ except Exception:
     pass
 
 
-def download_pdf_to_temp(url: str, connect_timeout: int, read_timeout: int, max_retries: int = 3) -> str:
-    """Download a PDF from URL to a temporary file with retries and larger timeouts."""
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+def download_document_to_temp(url: str, connect_timeout: int, read_timeout: int, max_retries: int = 3) -> str:
+    # Determine file extension from URL
+    file_ext = os.path.splitext(url.split('?')[0])[1].lower()
+    if not file_ext:
+        file_ext = '.pdf'  # Default to PDF if no extension
+    
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=file_ext)
     tmp_path = tmp.name
     tmp.close()
-    headers = {"User-Agent": "PolicyParse/1.0 (+https://example.local)"}
+    headers = {"User-Agent": "PolicyParse/1.0"}
     last_err: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
-            with requests.get(url, stream=True, timeout=(connect_timeout, read_timeout), headers=headers) as response:
+            # ULTRA FAST: Download entire file at once, no streaming
+            with requests.get(url, timeout=(connect_timeout, read_timeout), headers=headers) as response:
                 response.raise_for_status()
                 with open(tmp_path, "wb") as fh:
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB
-                        if chunk:
-                            fh.write(chunk)
+                    fh.write(response.content)  # Write entire content at once
             return tmp_path
         except Exception as e:
             last_err = e
             if attempt < max_retries:
-                time.sleep(2 ** attempt)
+                time.sleep(0.1)  # ULTRA FAST: Minimal backoff
             else:
-                # Cleanup temp file on final failure
                 try:
                     os.unlink(tmp_path)
                 except Exception:
                     pass
                 raise e
+
+
+@app.route("/")
+def health_check():
+    return jsonify({"status": "healthy", "service": "PolicyParse API"}), 200
 
 
 @app.post("/hackrx/run")
@@ -114,58 +122,96 @@ def hackrx_run():
 
     payload = request.get_json(silent=True) or {}
     document_url = payload.get("documents")
+    # Force a single fixed API user; do not accept user_id from clients
+    user_id = os.getenv("DEFAULT_USER_ID", "hackrxadmin")
     questions = payload.get("questions")
 
     if not isinstance(document_url, str) or not document_url:
         return jsonify({"error": "'documents' must be a non-empty URL string"}), 400
+    # user_id is fixed; no validation needed from client input
     if not isinstance(questions, list) or not all(isinstance(q, str) for q in questions):
         return jsonify({"error": "'questions' must be a list of strings"}), 400
 
-    # Download the PDF to a temporary file with retries
-    try:
-        temp_pdf_path = download_pdf_to_temp(
-            document_url,
-            connect_timeout=int(os.getenv("DOWNLOAD_CONNECT_TIMEOUT", "10")),
-            read_timeout=int(os.getenv("DOWNLOAD_READ_TIMEOUT", "120")),
-            max_retries=int(os.getenv("DOWNLOAD_RETRIES", "3")),
-        )
-    except Exception as download_error:
-        return jsonify({"error": f"Failed to download document: {str(download_error)}"}), 400
-
     vector_db = get_vector_db()
 
-    # PUBLIC user cache by URL: deterministic document_id
-    import hashlib
-    public_user_id = os.getenv("PUBLIC_USER_ID", "public")
-    deterministic_doc_id = hashlib.sha256(document_url.encode("utf-8")).hexdigest()
-
-    # Check if already in LanceDB for public user by document_id or source URL
+    # Fast-path: if this exact URL is already indexed for this user, skip download/extraction
     try:
-        table = vector_db.create_table("policy_documents")
-        # Try to see if any rows exist for this user+doc id
-        existing = table.to_pandas()
-        existing = existing[(existing["user_id"] == public_user_id) & ((existing["document_id"] == deterministic_doc_id) | (existing["source"] == document_url))]
-        if existing is None:
-            existing = []
+        # Use embedding-dimension aware table name to avoid dim mismatch across model changes
+        table_name = vector_db.get_default_table_name()
+        table = vector_db.create_table(table_name)
+        try:
+            existing_by_url = table.to_pandas(where=f"user_id = '{user_id}' AND source = '{document_url}'")
+        except Exception:
+            tmp_all = table.to_pandas()
+            existing_by_url = tmp_all[(tmp_all["user_id"] == user_id) & (tmp_all["source"] == document_url)]
     except Exception:
-        existing = []
+        existing_by_url = []
 
     chunks = None
     chunk_embeddings = None
     cached_doc_available = False
-    if isinstance(existing, list) or existing is None or (hasattr(existing, "empty") and existing.empty):
+    deterministic_doc_id = None
+
+    if not (isinstance(existing_by_url, list) or existing_by_url is None or (hasattr(existing_by_url, "empty") and existing_by_url.empty)):
+        # Cached by URL: reuse chunks and embeddings directly
+        try:
+            doc_rows = existing_by_url.sort_values("chunk_index").to_dict("records")
+            chunks = [row.get("content", "") for row in doc_rows]
+            chunk_embeddings = [row.get("embedding", []) for row in doc_rows]
+            deterministic_doc_id = doc_rows[0].get("document_id") if doc_rows else None
+            cached_doc_available = True
+        except Exception:
+            # Fall through to reprocess if for some reason cached rows are unreadable
+            cached_doc_available = False
+
+    if not cached_doc_available:
+        # Download the document to a temporary file with retries
+        try:
+            temp_doc_path = download_document_to_temp(
+                document_url,
+                connect_timeout=int(os.getenv("DOWNLOAD_CONNECT_TIMEOUT", "10")),
+                read_timeout=int(os.getenv("DOWNLOAD_READ_TIMEOUT", "120")),
+                max_retries=int(os.getenv("DOWNLOAD_RETRIES", "3")),
+            )
+        except Exception as download_error:
+            return jsonify({"error": f"Failed to download document: {str(download_error)}"}), 400
+
+        # Per-user deduplication by content hash of the actual document bytes; fallback to URL hash
+        import hashlib
+        try:
+            with open(temp_doc_path, "rb") as _fh:
+                doc_bytes = _fh.read()
+            deterministic_doc_id = hashlib.sha256(doc_bytes).hexdigest()
+        except Exception:
+            deterministic_doc_id = hashlib.sha256(document_url.encode("utf-8")).hexdigest()
+
+        # Check if already in LanceDB for this user by document_id (content-identical) or URL
+        try:
+            table_name = vector_db.get_default_table_name()
+            table = vector_db.create_table(table_name)
+            try:
+                existing = table.to_pandas(where=f"user_id = '{user_id}' AND (document_id = '{deterministic_doc_id}' OR source = '{document_url}')")
+            except Exception:
+                existing = table.to_pandas()
+                existing = existing[(existing["user_id"] == user_id) & ((existing["document_id"] == deterministic_doc_id) | (existing["source"] == document_url))]
+            if existing is None:
+                existing = []
+        except Exception:
+            existing = []
+
+    if not cached_doc_available and (isinstance(existing, list) or existing is None or (hasattr(existing, "empty") and existing.empty)):
         # Not cached: extract, chunk and embed, then insert once
         try:
-            markdown_content = vector_db.extract_document_content(temp_pdf_path)
+            markdown_content = vector_db.extract_document_content(temp_doc_path)
         except Exception as extraction_error:
             try:
-                os.unlink(temp_pdf_path)
+                os.unlink(temp_doc_path)
             except Exception:
                 pass
             return jsonify({"error": f"Failed to extract document content: {str(extraction_error)}"}), 500
         finally:
             try:
-                os.unlink(temp_pdf_path)
+                os.unlink(temp_doc_path)
             except Exception:
                 pass
 
@@ -180,24 +226,29 @@ def hackrx_run():
         if not chunk_embeddings:
             return jsonify({"error": "Failed to compute embeddings for document"}), 500
 
-        # Insert into LanceDB for public user once
+        # Insert into LanceDB for this user once using precomputed chunks/embeddings
         try:
-            vector_db.add_document(
-                pdf_path=temp_pdf_path,
-                user_id=public_user_id,
-                access_level="public",
+            vector_db.add_document_from_chunks(
+                chunks=chunks,
+                embeddings=chunk_embeddings,
+                user_id=user_id,
+                access_level="private",
                 doc_type="policy",
-                table_name="policy_documents",
+                 table_name=table_name,
                 document_id=deterministic_doc_id,
-                source_override=document_url,
+                source=document_url,
             )
             cached_doc_available = True
         except Exception:
             # Proceed even if insert fails; answers can be generated from current process
             pass
-    else:
+    elif not cached_doc_available:
         # Cached: fetch chunks from LanceDB for this doc to build context quickly
         try:
+            try:
+                os.unlink(temp_doc_path)
+            except Exception:
+                pass
             doc_rows = existing.sort_values("chunk_index").to_dict("records")
             chunks = [row["content"] for row in doc_rows]
             chunk_embeddings = [row["embedding"] for row in doc_rows]
@@ -205,10 +256,10 @@ def hackrx_run():
         except Exception:
             # Fallback to reprocess if reading cached rows fails
             try:
-                markdown_content = vector_db.extract_document_content(temp_pdf_path)
+                markdown_content = vector_db.extract_document_content(temp_doc_path)
             finally:
                 try:
-                    os.unlink(temp_pdf_path)
+                    os.unlink(temp_doc_path)
                 except Exception:
                     pass
             if not markdown_content:
@@ -216,61 +267,48 @@ def hackrx_run():
             chunks = vector_db.chunk_text(markdown_content)
             chunk_embeddings = vector_db.create_embeddings(chunks)
 
-    # Prepare answering setup
+    # Prepare answering setup with parallel processing
     llm_processor = get_llm()
     answers: List[str] = []
 
     # Batch-encode questions to reduce overhead
     try:
-        question_embeddings = vector_db.embedding_model.encode(questions)
+        # Batch encode with normalization for stable cosine similarity
+        question_embeddings = vector_db.embedding_model.encode(
+            questions,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
     except Exception:
-        question_embeddings = [vector_db.embedding_model.encode([q])[0] for q in questions]
+        question_embeddings = [vector_db.embedding_model.encode([q], show_progress_bar=False, normalize_embeddings=True, convert_to_numpy=True)[0] for q in questions]
 
-    # Build stronger context per question
+    # ULTRA FAST: Smart context selection for accuracy and speed
+    answers = []
     for question, question_embedding in zip(questions, question_embeddings):
         try:
-            if cached_doc_available:
-                # Prefer LanceDB ANN search within this document for better recall
-                top_rows = get_vector_db().search_similar_in_document(
-                    query=question,
-                    user_id=public_user_id,
-                    document_id=deterministic_doc_id,
-                    table_name="policy_documents",
-                    limit=6,
-                )
-                context = "\n\n".join([row.get("content", "") for row in top_rows])
-                if not context:
-                    # Fallback to local cosine ranking if ANN returns nothing
-                    top_indices = rank_top_k_indices(chunk_embeddings, question_embedding, top_k=6)
-                    context = "\n\n".join(chunks[i] for i in top_indices)
-            else:
-                top_indices = rank_top_k_indices(chunk_embeddings, question_embedding, top_k=6)
-                context = "\n\n".join(chunks[i] for i in top_indices)
+            # ULTRA FAST: Get top 2 chunks for better accuracy
+            top_indices = rank_top_k_indices(chunk_embeddings, question_embedding, top_k=2)
+            context = "\n\n".join([chunks[i] for i in top_indices]) if top_indices else ""
 
             if llm_processor.is_available():
-                # Enforce numeric precision and policy quoting
-                prompt = (
-                    "Answer with exact numbers, durations, limits, and definitions as stated. "
-                    "Prefer quoting the policy text verbatim for numeric constraints. "
-                    "If not in context, reply 'Information not found in available documents.'\n\n"
-                ) + llm_processor.prompt_template.format(query=question, context=context)
+                # ULTRA FAST: Optimized prompt for accuracy
+                prompt = llm_processor.prompt_template.format(query=question, context=context)
                 response = llm_processor.llm.invoke(prompt)
                 answer_text = (response.content or "").strip()
             else:
-                best_chunk = chunks[top_indices[0]] if top_indices else ""
-                answer_text = (best_chunk[:280] + "...") if len(best_chunk) > 280 else best_chunk
+                # ULTRA FAST: Return meaningful excerpt
+                answer_text = (context[:200] + "...") if len(context) > 200 else context
 
             if not answer_text:
-                answer_text = "Information not found in available documents."
+                answer_text = "Information not found."
 
             answers.append(answer_text)
         except Exception:
-            answers.append("Information not found in available documents.")
+            answers.append("Information not found.")
 
     return jsonify({"answers": answers})
 
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-
-

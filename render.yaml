@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: policyparse-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT api:app --timeout 300
+    healthCheckPath: /
+    envVars:
+      - key: HACKRX_TOKEN
+        value: fbc6d34d08858901d26a10f1b8796c2e77577b24bf91053390f858a35af05df7
+      - key: ALLOW_PUBLIC
+        value: false
+      - key: DEFAULT_USER_ID
+        value: hackrxadmin
+      - key: DOWNLOAD_CONNECT_TIMEOUT
+        value: 10
+      - key: DOWNLOAD_READ_TIMEOUT
+        value: 120
+      - key: DOWNLOAD_RETRIES
+        value: 3
+      - key: EMBED_MODEL
+        value: all-MiniLM-L6-v2
+      - key: EMBED_BATCH
+        value: "32"

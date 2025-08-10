@@ -267,13 +267,11 @@ def hackrx_run():
             chunks = vector_db.chunk_text(markdown_content)
             chunk_embeddings = vector_db.create_embeddings(chunks)
 
-    # Prepare answering setup with parallel processing
     llm_processor = get_llm()
-    answers: List[str] = []
-
-    # Batch-encode questions to reduce overhead
+    # Combine all questions into a single prompt for one-shot LLM response
+    combined_questions = "\n".join(f"Q{i+1}: {q}" for i, q in enumerate(questions))
+    # Use all top chunks for all questions as context (for brevity, use top 2 for each question)
     try:
-        # Batch encode with normalization for stable cosine similarity
         question_embeddings = vector_db.embedding_model.encode(
             questions,
             show_progress_bar=False,
@@ -283,29 +281,37 @@ def hackrx_run():
     except Exception:
         question_embeddings = [vector_db.embedding_model.encode([q], show_progress_bar=False, normalize_embeddings=True, convert_to_numpy=True)[0] for q in questions]
 
-    # ULTRA FAST: Smart context selection for accuracy and speed
-    answers = []
-    for question, question_embedding in zip(questions, question_embeddings):
-        try:
-            # ULTRA FAST: Get top 2 chunks for better accuracy
-            top_indices = rank_top_k_indices(chunk_embeddings, question_embedding, top_k=2)
-            context = "\n\n".join([chunks[i] for i in top_indices]) if top_indices else ""
+    context_chunks = []
+    for question_embedding in question_embeddings:
+        top_indices = rank_top_k_indices(chunk_embeddings, question_embedding, top_k=2)
+        context_chunks.extend([chunks[i] for i in top_indices if i < len(chunks)])
+    # Deduplicate context chunks
+    context = "\n\n".join(dict.fromkeys(context_chunks))
 
-            if llm_processor.is_available():
-                # ULTRA FAST: Optimized prompt for accuracy
-                prompt = llm_processor.prompt_template.format(query=question, context=context)
-                response = llm_processor.llm.invoke(prompt)
-                answer_text = (response.content or "").strip()
-            else:
-                # ULTRA FAST: Return meaningful excerpt
-                answer_text = (context[:200] + "...") if len(context) > 200 else context
-
-            if not answer_text:
-                answer_text = "Information not found."
-
-            answers.append(answer_text)
-        except Exception:
-            answers.append("Information not found.")
+    if llm_processor.is_available():
+        prompt = (
+            "Answer each of the following questions separately and return only a numbered list of answers, one per question, in the same order. "
+            "Keep each answer short, humanlike, specific, and accurate. "
+            "Avoid unnecessary details, repetition, or formatting. "
+            "If information is not found, say 'Information not found.'\n\n"
+            f"Questions:\n{combined_questions}\n\nContext:\n{context}\nAnswers:"
+        )
+        response = llm_processor.llm.invoke(prompt)
+        answer_text = (response.content or "").strip()
+        # Split numbered answers into a list
+        import re
+        answers = re.findall(r"\d+\.\s*(.*?)(?=\n\d+\.|$)", answer_text, re.DOTALL)
+        answers = [a.strip().replace('\n', ' ') for a in answers if a.strip()]
+        # If not enough answers, fallback to splitting by newlines
+        if len(answers) < len(questions):
+            alt = [a.strip() for a in answer_text.split('\n') if a.strip()]
+            if len(alt) == len(questions):
+                answers = alt
+        # If still not enough, pad with 'Information not found.'
+        while len(answers) < len(questions):
+            answers.append('Information not found.')
+    else:
+        answers = [(context[:200] + "...") if len(context) > 200 else context] * len(questions)
 
     return jsonify({"answers": answers})
 

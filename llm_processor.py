@@ -18,7 +18,6 @@ class LLMProcessor:
 Guidelines:
 - Be specific and accurate
 - Include key numbers, dates, and conditions when mentioned
-- Provide 2-3 sentences of relevant detail
 - If information is not in the context, say "Information not found in available documents"
 
 Question: {query}
